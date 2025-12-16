@@ -1,33 +1,32 @@
 # uw_housing_model.py
 """
 UW HFS Housing Structural Risk Model (Index-Based, Outcome Neutral)
-v4.4 - Feedback Integration
+v4.5 - Occupancy Pricing Stress
+
+Changes in v4.5 (Occupancy Pricing Stress):
+- CRITICAL FIX: Added occupancy-based pricing stress to revenue calculation.
+  Previous versions allowed 80% occupancy to show healthy DSCR because rent
+  escalation was "papering over" the lost students. In reality, when you're
+  struggling to fill beds, you can't aggressively raise rents.
+- New parameter "Low-Occupancy Pricing Stress" (default 30%) controls how much
+  low occupancy limits rent growth. Higher values = more market pressure.
+- At 80% occupancy with 30% stress, revenue growth is now ~6% lower, causing
+  realistic DSCR pressure that matches intuition.
 
 Changes in v4.4 (Feedback Integration):
-- FIX: "UW Class Size Change" now ramps to 2035 like other levers, preserving 2025=100.
-  Previous version applied change to ALL years including 2025, breaking the base-year anchor.
-- FIX: Closing buildings no longer reduces debt service (unrealistic).
-  Debt factor now only increases for new construction; existing bonds remain.
-  Expense factor still decreases for closures (fewer buildings to maintain).
-- FIX: Chart caption for Beds Filled vs Capacity now correctly explains indexed comparison.
-- FIX: Removed dollar signs from narrative text (maintains "no currency" posture).
-- FIX: Clarified that base DSCR is from 2022 audited data, not a 2025 value.
-- FIX: Python 3.9 compatibility (replaced | union syntax with typing.Union/Optional).
-- Updated slider labels to match "by 2035" ramping behavior.
+- FIX: "UW Class Size Change" now ramps to 2035 (preserves 2025=100 anchor)
+- FIX: Closing buildings no longer reduces debt service (bonds already issued)
+- FIX: Chart caption correctly explains indexed comparison
+- FIX: Removed dollar signs from narrative text
+- FIX: Python 3.9 compatibility
 
 Changes in v4.3 (Capacity Cost Fix):
 - Capacity changes now affect costs and debt, not just revenue cap.
 - Capacity_Index now indexed to base CAPACITY, not base HEADCOUNT.
-- Added capacity cost sensitivity sliders.
 
-Changes in v4.2 (Code Review Implementation):
+Changes in v4.2 (Code Review):
 - Extracted demand index calculation into dedicated function.
 - Reduced executive jargon in labels and tooltips.
-- Added plain-English interpretation callouts for KPI cards.
-
-Previous fixes (v4.1):
-- Fixed Altair chart collapse bug with debt-peak band layer.
-- Added "UW Enrollment Trend (Class Size)" slider.
 
 Constraints:
 - No absolute dollars are computed, displayed, or exported.
@@ -192,8 +191,10 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "custom_peak_year": 2030,
         "focus_year": 2035,
         # Capacity cost sensitivities (v4.3 addition)
-        "capacity_expense_sensitivity_pct": 50,  # 50% of capacity change → expense change
-        "capacity_debt_sensitivity_pct": 150,    # 150% of capacity change → debt change
+        "capacity_expense_sensitivity_pct": 50,
+        "capacity_debt_sensitivity_pct": 150,
+        # Occupancy pricing stress (v4.5 addition)
+        "occupancy_pricing_stress_pct": 30,  # 0.30 exponent (moderate market pressure)
     },
     "Structural Squeeze": {
         "debt_shape": 'The "Cliff" (Risk)',
@@ -215,6 +216,7 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "focus_year": 2035,
         "capacity_expense_sensitivity_pct": 50,
         "capacity_debt_sensitivity_pct": 150,
+        "occupancy_pricing_stress_pct": 30,
     },
     "Demographic Trough": {
         "debt_shape": "Flat (Baseline)",
@@ -236,6 +238,7 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "focus_year": 2035,
         "capacity_expense_sensitivity_pct": 50,
         "capacity_debt_sensitivity_pct": 150,
+        "occupancy_pricing_stress_pct": 30,
     },
     "Bond Stress Test (Illustrative)": {
         "debt_shape": 'The "Cliff" (Risk)',
@@ -257,6 +260,7 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "focus_year": 2035,
         "capacity_expense_sensitivity_pct": 50,
         "capacity_debt_sensitivity_pct": 150,
+        "occupancy_pricing_stress_pct": 30,
     },
     "Custom (Keep Current Settings)": {},
 }
@@ -732,6 +736,50 @@ def build_debt_index(
     return debt
 
 
+def compute_occupancy_pricing_stress(
+    occupancy_index: np.ndarray,
+    stress_exponent: float = 0.3,
+) -> np.ndarray:
+    """
+    Calculate pricing stress factor based on occupancy level.
+
+    v4.5 Addition: This function addresses the economic flaw where the model
+    allowed rent escalation to fully offset occupancy declines.
+
+    Economic reality: When you're at 80% occupancy, you're already struggling
+    to fill beds. You cannot aggressively raise rents without losing even more
+    students. Market pressure limits your pricing power.
+
+    The stress factor reduces effective rent growth when occupancy is below baseline:
+    - At 100% occupancy: full pricing power (stress = 1.0)
+    - At 80% occupancy with exponent=0.3: stress ≈ 0.94 (6% reduction in rent growth)
+    - At 70% occupancy with exponent=0.3: stress ≈ 0.89 (11% reduction)
+
+    Higher exponent = more aggressive stress (stronger market pressure).
+
+    Args:
+        occupancy_index: Occupancy as index (100 = baseline occupancy)
+        stress_exponent: Controls severity of pricing pressure.
+            0.0 = no stress (current behavior, unrealistic)
+            0.3 = moderate stress (recommended)
+            0.5 = strong stress (competitive market)
+
+    Returns:
+        Array of stress factors (1.0 = no stress, <1.0 = pricing pressure)
+    """
+    occupancy_ratio = occupancy_index / BASE_INDEX
+
+    # When occupancy is at or above baseline, no stress
+    # When occupancy is below baseline, pricing power is reduced
+    stress_factor = np.where(
+        occupancy_ratio >= 1.0,
+        1.0,
+        np.power(occupancy_ratio, stress_exponent)
+    )
+
+    return stress_factor
+
+
 def get_debt_peak_window(
     debt_shape: str,
     custom_peak_year: int,
@@ -776,6 +824,7 @@ def run_model(
     custom_peak_year: int,
     capacity_expense_sensitivity: float = 0.50,
     capacity_debt_sensitivity: float = 1.50,
+    occupancy_pricing_stress: float = 0.30,
 ) -> pd.DataFrame:
     """
     Run the structural risk model and return year-by-year projections.
@@ -805,6 +854,10 @@ def run_model(
         capacity_debt_sensitivity: How much debt service scales with capacity
             changes. 1.50 means 10% more capacity → 15% more debt service
             (construction is capital-intensive).
+        occupancy_pricing_stress: How much low occupancy limits rent growth.
+            0.0 = no stress (unrealistic), 0.3 = moderate (recommended),
+            0.5 = strong market pressure. Captures the reality that you can't
+            raise rents aggressively when you're struggling to fill beds.
 
     Returns:
         DataFrame with all projection metrics by year
@@ -876,12 +929,27 @@ def run_model(
         debt_sensitivity=capacity_debt_sensitivity,
     )
 
-    # Revenue and expense indices with compound growth
-    # Code Review Note (v4.2): Expenses now scale with BOTH inflation AND capacity
-    revenue_index = occupancy_index * np.power(1.0 + float(rate_escalation), t)
+    # Calculate occupancy pricing stress
+    # v4.5 FIX: When occupancy is low, you can't raise rents as aggressively
+    # This addresses the bug where 80% occupancy still showed healthy DSCR
+    # because rent escalation was "papering over" the lost students
+    pricing_stress_factor = compute_occupancy_pricing_stress(
+        occupancy_index,
+        stress_exponent=occupancy_pricing_stress,
+    )
+
+    # Revenue index with compound growth AND pricing stress
+    # v4.5: Revenue = Occupancy × Rent_Growth × Pricing_Stress
+    # At 100% occupancy: full rent growth captured
+    # At 80% occupancy: reduced rent growth (market pressure)
+    base_rent_growth = np.power(1.0 + float(rate_escalation), t)
+    effective_rent_growth = base_rent_growth * pricing_stress_factor
+    revenue_index = occupancy_index * effective_rent_growth
+
+    # Expense index with compound growth and capacity scaling
     expense_index = (
         BASE_INDEX
-        * expense_cap_factor  # NEW: capacity scaling
+        * expense_cap_factor
         * np.power(1.0 + float(expense_inflation), t)
     )
 
@@ -936,11 +1004,12 @@ def run_model(
             "Demographic_Index": demographic_index.astype(float),
             "Demand_Index": demand_index.astype(float),
             "Capacity_Headcount_Cap": capacity_headcount.astype(float),
-            "Capacity_Index": capacity_index.astype(float),  # Now pre-calculated
-            "Expense_Cap_Factor": expense_cap_factor.astype(float),  # NEW: transparency
-            "Debt_Cap_Factor": debt_cap_factor.astype(float),  # NEW: transparency
+            "Capacity_Index": capacity_index.astype(float),
+            "Expense_Cap_Factor": expense_cap_factor.astype(float),
+            "Debt_Cap_Factor": debt_cap_factor.astype(float),
             "Occupied_Headcount": occupied_headcount.astype(float),
             "Occupancy_Index": occupancy_index.astype(float),
+            "Pricing_Stress_Factor": pricing_stress_factor.astype(float),  # v4.5 addition
             "Revenue_Index": revenue_index.astype(float),
             "Expense_Index": expense_index.astype(float),
             "Debt_Index": debt_index.astype(float),
@@ -1210,6 +1279,10 @@ if "capacity_expense_sensitivity_pct" not in st.session_state:
 
 if "capacity_debt_sensitivity_pct" not in st.session_state:
     st.session_state["capacity_debt_sensitivity_pct"] = 150
+
+# v4.5 addition: occupancy pricing stress
+if "occupancy_pricing_stress_pct" not in st.session_state:
+    st.session_state["occupancy_pricing_stress_pct"] = 30
 
 
 # =============================================================================
@@ -1482,6 +1555,27 @@ with st.sidebar:
             ),
         )
 
+        st.divider()
+        st.caption(
+            "**Pricing pressure when occupancy drops:**"
+        )
+        st.slider(
+            "Low-Occupancy Pricing Stress",
+            min_value=0,
+            max_value=100,
+            step=5,
+            key="occupancy_pricing_stress_pct",
+            format="%d%%",
+            help=(
+                "How much does low occupancy limit your ability to raise rents?\n\n"
+                "When beds are empty, market pressure limits pricing power.\n\n"
+                "• 0% = No stress (can raise rents regardless of occupancy, unrealistic)\n"
+                "• 30% = Moderate stress (recommended)\n"
+                "• 50% = Strong stress (competitive market)\n\n"
+                "Higher values mean occupancy declines hurt revenue more."
+            ),
+        )
+
     with st.expander("Reference: Bond Requirements", expanded=False):
         st.write(f"**DSCR Anchor (latest audited, 2022):** {base_dscr:.2f}")
         st.caption("This is the most recent audited DSCR, used as the baseline anchor for projections.")
@@ -1522,6 +1616,10 @@ params = {
     ) / 100.0,
     "capacity_debt_sensitivity": float(
         st.session_state.get("capacity_debt_sensitivity_pct", 150)
+    ) / 100.0,
+    # v4.5 addition: occupancy pricing stress
+    "occupancy_pricing_stress": float(
+        st.session_state.get("occupancy_pricing_stress_pct", 30)
     ) / 100.0,
 }
 
@@ -2019,9 +2117,10 @@ with tabs[1]:
         "Demographic_Index",
         "Demand_Index",
         "Capacity_Index",
-        "Expense_Cap_Factor",  # v4.3 addition
-        "Debt_Cap_Factor",     # v4.3 addition
+        "Expense_Cap_Factor",
+        "Debt_Cap_Factor",
         "Occupancy_Index",
+        "Pricing_Stress_Factor",  # v4.5 addition
         "Revenue_Index",
         "Expense_Index",
         "Debt_Index",
@@ -2042,9 +2141,10 @@ with tabs[1]:
         "Demographic_Index": "Blended Demographic Index",
         "Demand_Index": "Total Demand Index",
         "Capacity_Index": "Capacity Index",
-        "Expense_Cap_Factor": "Capacity→Expense Factor",  # v4.3 addition
-        "Debt_Cap_Factor": "Capacity→Debt Factor",        # v4.3 addition
+        "Expense_Cap_Factor": "Capacity→Expense Factor",
+        "Debt_Cap_Factor": "Capacity→Debt Factor",
         "Occupancy_Index": "Occupancy Index",
+        "Pricing_Stress_Factor": "Pricing Stress Factor",  # v4.5 addition
         "Revenue_Index": "Revenue Index",
         "Expense_Index": "Expense Index",
         "Debt_Index": "Debt Index",
@@ -2071,9 +2171,10 @@ with tabs[1]:
             "Demographic_Index": 1,
             "Demand_Index": 1,
             "Capacity_Index": 1,
-            "Expense_Cap_Factor": 2,  # v4.3 addition
-            "Debt_Cap_Factor": 2,     # v4.3 addition
+            "Expense_Cap_Factor": 2,
+            "Debt_Cap_Factor": 2,
             "Occupancy_Index": 1,
+            "Pricing_Stress_Factor": 2,  # v4.5 addition
             "Revenue_Index": 1,
             "Expense_Index": 1,
             "Debt_Index": 1,
@@ -2114,6 +2215,7 @@ with tabs[1]:
 | Capacity→Expense Factor | Multiplier on operating costs from capacity changes (1.0 = no change) |
 | Capacity→Debt Factor | Multiplier on debt service from capacity changes (1.0 = no change) |
 | Occupancy Index | Actual beds filled (demand capped by capacity) |
+| Pricing Stress Factor | Reduction in rent growth from low occupancy (1.0 = full pricing power) |
 | Revenue Index | Revenue from housing operations |
 | Expense Index | Operating cost growth (includes capacity and inflation effects) |
 | Debt Index | Debt service level (includes timing pattern and capacity effects) |
@@ -2132,7 +2234,7 @@ with tabs[1]:
 
 st.divider()
 st.caption(
-    "UW HFS Housing Structural Risk Model v4.4 | "
+    "UW HFS Housing Structural Risk Model v4.5 | "
     "Index-based projections for strategic planning | "
     "Questions? Contact HFS Finance"
 )
