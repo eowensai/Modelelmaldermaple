@@ -2231,10 +2231,10 @@ with tabs[1]:
 # =============================================================================
 # FOOTER
 # =============================================================================
-
-st.divider()
-st.caption(
-    "UW HFS Housing Structural Risk Model v4.5 | "
-    "Index-based projections for strategic planning | "
-    "Questions? Contact HFS Finance"
+#
+#st.divider()
+#st.caption(
+#    "UW HFS Housing Structural Risk Model v4.5 | "
+#    "Index-based projections for strategic planning | "
+#    "Questions? Contact HFS Finance"
 )
